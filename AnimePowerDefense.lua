@@ -1003,6 +1003,33 @@ secControl:Toggle({
     Name = "Auto click reward pop-ups (end of match)", Default = true,
     Callback = function(v) M.autoDismiss = v end,
 }, "AutoDismissRewards")
+-- Anti AFK: Roblox fires LocalPlayer.Idled after ~20 min without input; answering it with a
+-- virtual click keeps the session alive. Existing Idled handlers are disabled while it is on.
+local VirtualUser = game:GetService("VirtualUser")
+local idledConn
+local function setAntiAfk(v)
+    M.antiAfk = v
+    if idledConn then idledConn:Disconnect() idledConn = nil end
+    pcall(function()
+        for _, c in ipairs(getconnections(Players.LocalPlayer.Idled)) do
+            if c ~= idledConn then if v then c:Disable() else c:Enable() end end
+        end
+    end)
+    if v then
+        idledConn = Players.LocalPlayer.Idled:Connect(function()
+            if not M.antiAfk then return end
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        end)
+    end
+end
+secControl:Toggle({
+    Name = "Anti AFK", Default = true,
+    Callback = setAntiAfk,
+}, "AntiAfk")
+setAntiAfk(true)
 secControl:Button({
     Name = "Run macro now (testing)",
     Callback = function()
@@ -1945,6 +1972,7 @@ end
 ---------------------------------------------------------------------------
 function M.destroy()
     M.alive = false
+    pcall(function() setAntiAfk(false) end)
     M.armed = false
     M.recording = false
     M.finalizing = false
