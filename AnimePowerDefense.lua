@@ -767,6 +767,11 @@ local function rewardPopupOpen()
     return guiVisible("View")
 end
 
+-- Auto replay waits until every reward pop-up has been clicked through.
+local function rewardsBlocking()
+    return rewardPopupOpen()
+end
+
 task.spawn(function()
     local function phaseNow()
         if guiVisible("Ending") then return "ending" end
@@ -786,7 +791,7 @@ task.spawn(function()
             if phase ~= "ending" then endSeen = os.clock() end
             if M.playing then stopPlayback() end
             startable = true
-            if M.autoReplay and not (M.recording or M.finalizing) and not rewardPopupOpen()
+            if M.autoReplay and not (M.recording or M.finalizing) and not rewardsBlocking()
                 and os.clock() - endSeen >= 1.5 and os.clock() - lastRetry >= 6 then
                 lastRetry = os.clock()
                 addLog("Auto replay")
@@ -1566,7 +1571,7 @@ task.spawn(function()
         task.wait(0.5)
         if guiVisible("Ending") then
             endSince = endSince or os.clock()
-            if P.auto and not (M.recording or M.finalizing) and not rewardPopupOpen()
+            if P.auto and not (M.recording or M.finalizing) and not rewardsBlocking()
                 and os.clock() - endSince >= 1.5 and os.clock() - P.lastFire >= 6 then
                 local key = pickedPortalKey()
                 if not key then
@@ -1586,10 +1591,50 @@ end)
 M.replayPortal = replayPickedPortal
 pcall(refreshPortals)
 
--- Reward pop-up clicker. A mouse click is what the game listens for (anywhere not on a GUI
--- button, 0.3s apart), so we send a simulated click at the middle of the screen. Only in a
--- match: in the lobby the same frame is used for viewing your own units, which we leave alone.
+-- Reward pop-up clicker. While a pop-up is open the game keeps a UserInputService.InputBegan
+-- handler that moves to the next reward on a left click. We find that handler in memory and
+-- call it directly with a fake click, so no real or simulated mouse is needed: it works with
+-- the window unfocused, the screen off, or on another desktop. A simulated mouse click is only
+-- a backup if the handler cannot be found or the pop-up stops moving. Only in a match: in the
+-- lobby the same frame is used for viewing your own units, which we leave alone.
+local UIS = game:GetService("UserInputService")
 local VIM = game:GetService("VirtualInputManager")
+
+local function popupView()
+    local pg   = LocalPlayer:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("Main")
+    return main and main:FindFirstChild("View")
+end
+
+-- the handler holds a "skip" function, and skip holds the Main.View frame
+local function findPopupHandler()
+    local view = popupView()
+    if not view or not filtergc then return nil end
+    local ok, found = pcall(filtergc, "function", { Upvalues = { UIS } }, false)
+    if not ok or type(found) ~= "table" then return nil end
+    for _, f in ipairs(found) do
+        local okU, ups = pcall(debug.getupvalues, f)
+        if okU and type(ups) == "table" then
+            for _, v in pairs(ups) do
+                if type(v) == "function" then
+                    local ok2, inner = pcall(debug.getupvalues, v)
+                    if ok2 and type(inner) == "table" then
+                        for _, x in pairs(inner) do
+                            if x == view then return f end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function callPopupHandler()
+    local h = findPopupHandler()
+    if not h then return false end
+    return (pcall(h, { UserInputType = Enum.UserInputType.MouseButton1, KeyCode = Enum.KeyCode.Unknown }, false))
+end
 local function clickScreen()
     local cam = workspace.CurrentCamera
     local vp  = cam and cam.ViewportSize or Vector2.new(1280, 720)
@@ -1601,11 +1646,27 @@ local function clickScreen()
 end
 
 task.spawn(function()
+    local lastSig
     while genv.__ATDMacro == M and M.alive do
         task.wait(0.45)
-        if M.autoDismiss and rewardPopupOpen() and not inLobby()
+        local open = rewardPopupOpen()
+        -- remember when the pop-up last changed (shown, or moved on to the next reward)
+        local pg   = LocalPlayer:FindFirstChild("PlayerGui")
+        local view = pg and pg:FindFirstChild("Main") and pg.Main:FindFirstChild("View")
+        local unit = view and view:FindFirstChild("Unit")
+        local sig  = open and (unit and unit.Text or "?") or nil
+        if sig ~= lastSig then
+            lastSig = sig
+            M.popupChangedAt = os.clock()
+        end
+        if M.autoDismiss and open and not inLobby()
             and not (M.recording or M.finalizing) then
-            clickScreen()
+            local viaHandler = callPopupHandler()
+            M.popupMode = viaHandler and "handler" or "mouse"
+            -- backup: handler missing, or the pop-up has not moved for a while
+            if not viaHandler or os.clock() - (M.popupChangedAt or os.clock()) > 2 then
+                clickScreen()
+            end
         end
     end
 end)
