@@ -252,6 +252,7 @@ local group = Window:TabGroup()
 local tabMacro    = group:Tab({ Name = "Macro",        Image = "rbxassetid://18821914323" })
 local tabJoiners  = group:Tab({ Name = "Joiners",      Image = "rbxassetid://18821914323" })
 local tabPortal   = group:Tab({ Name = "Portal",       Image = "rbxassetid://18821914323" })
+local tabEvent    = group:Tab({ Name = "Event",        Image = "rbxassetid://18821914323" })
 local tabLog      = group:Tab({ Name = "Steps & Log",  Image = "rbxassetid://18821914323" })
 local tabSettings = group:Tab({ Name = "Settings",     Image = "rbxassetid://10734950309" })
 
@@ -706,6 +707,9 @@ end
 -- One run of the macro. Called by the game watcher when a game starts (or by "Run macro now").
 local function runMacro()
     if M.playing or M.runBusy or M.recording or M.finalizing then return end
+    if M.holdMacro and M.holdMacro() then
+        return notify("Waiting for the event modifier selection to finish first.")
+    end
     if #M.steps == 0 then return notify("No macro loaded or recorded.") end
     if not getPlaced() then return notify("Can't reach the game's unit data. Are you in a match?") end
     M.playing = true
@@ -805,10 +809,16 @@ task.spawn(function()
                 fireGame("SkipIntermission")
             end
         else -- running
-            if startable then
+            -- the event picker restarted the match: the new game needs a fresh macro start
+            if M.rearm then M.rearm = false startable = true end
+            local held = M.holdMacro and M.holdMacro()    -- event modifier selection / restart in progress
+            if startable and not held and not (M.runBusy and not M.playing) then
                 startable = false
                 if M.armed and not (M.recording or M.finalizing or M.playing or M.runBusy) then
-                    task.delay(0.5, runMacro)
+                    task.delay(0.5, function()
+                        if M.holdMacro and M.holdMacro() then M.rearm = true   -- a restart began meanwhile: try again later
+                        else runMacro() end
+                    end)
                 end
             end
         end
@@ -1801,6 +1811,248 @@ task.spawn(function()
         end
     end
 end)
+
+---------------------------------------------------------------------------
+-- Event tab: Garden Maze (infinite event) modifier picker.
+-- At the start of the event the server offers some modifier cards plus a lane count
+-- (Main.SelectionPrompt). Confirming is   GameService.RF.ModeCondition("ConfirmedSelection",
+-- { [cardName] = true, ... }, lanes)   - exactly what the Confirm button sends. The full card
+-- pool is read from Resources.Modes["Garden Maze"].Cards, so every modifier the game defines is
+-- listed (the server offers only some of them each time, so one is often missing on screen).
+-- Restarting is   GameService.RF.RestartMatch()   (Settings > Restart match).
+---------------------------------------------------------------------------
+local EV_MODE_ALL      = "Pick every offered modifier"
+local EV_MODE_WANTED   = "Pick only modifiers with priority > 0"
+local EV_MODE_RESTART  = "Priority + restart until wanted one is offered"
+local EV_MODES = { EV_MODE_ALL, EV_MODE_WANTED, EV_MODE_RESTART }
+
+local EV = { auto = false, mode = EV_MODE_ALL, restarts = 0, busy = false, seen = nil, sliders = {} }
+M.event = EV
+
+local gardenCards = {}
+pcall(function()
+    local mod = RS.Modules.Resources.Modes:FindFirstChild("Garden Maze")
+    local data = mod and require(mod)
+    if data and type(data.Cards) == "table" then gardenCards = data.Cards end
+end)
+local evCardNames = {}
+for name in pairs(gardenCards) do table.insert(evCardNames, name) end
+table.sort(evCardNames)
+
+local evStatus, evLaneSlider, evLevelSlider
+local function evSay(text)
+    EV.lastStatus = text
+    if evStatus then pcall(function() evStatus:UpdateBody(text) end) end
+end
+
+local function sliderInt(s, fallback)
+    return math.floor((tonumber(s and s.Value) or fallback) + 0.5)   -- .Value is current even after a config load
+end
+local function evPriority(name) return sliderInt(EV.sliders[name], 0) end
+local function evLanes() return math.clamp(sliderInt(evLaneSlider, 12), 1, 12) end
+local function evPerLevel() return math.max(1, sliderInt(evLevelSlider, 10)) end
+
+-- cards the server is offering right now = real cards under Cards (the template sits in UIListLayout)
+local function evOffered(prompt)
+    local out = {}
+    local cards = prompt:FindFirstChild("Cards")
+    if cards then
+        for _, c in ipairs(cards:GetChildren()) do
+            if c:IsA("GuiButton") then table.insert(out, c.Name) end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- returns accept?, picks
+local function evDecide(offered)
+    local picks, wanted = {}, {}
+    if EV.mode == EV_MODE_ALL then
+        for _, n in ipairs(offered) do picks[n] = true end
+        return true, picks
+    end
+    for _, n in ipairs(offered) do
+        if evPriority(n) > 0 then table.insert(wanted, n) end
+    end
+    local function pickWanted() for _, n in ipairs(wanted) do picks[n] = true end end
+    if EV.mode == EV_MODE_WANTED then
+        pickWanted()
+        return true, picks
+    end
+
+    -- priority + restart: distinct priority values, best first. Every `perLevel` restarts the
+    -- bar drops one level, so the 2nd choice is accepted once the 1st kept not showing up.
+    local vals, seen = {}, {}
+    for _, n in ipairs(evCardNames) do
+        local p = evPriority(n)
+        if p > 0 and not seen[p] then seen[p] = true table.insert(vals, p) end
+    end
+    table.sort(vals, function(a, b) return a > b end)
+    local level = math.floor(EV.restarts / evPerLevel()) + 1
+    local accept = (#vals == 0) or (level > #vals)
+    if not accept then
+        -- a priority level is satisfied only when EVERY modifier sharing that priority is offered
+        local offeredSet = {}
+        for _, n in ipairs(offered) do offeredSet[n] = true end
+        for k = 1, level do
+            local complete = true
+            for _, n in ipairs(evCardNames) do
+                if evPriority(n) == vals[k] and not offeredSet[n] then complete = false break end
+            end
+            if complete then accept = true break end
+        end
+    end
+    if accept then
+        -- the wanted modifier is there: take it AND every other offered modifier
+        for _, n in ipairs(offered) do picks[n] = true end
+    end
+    return accept, picks
+end
+
+local function evConfirm(picks, lanes)
+    local rf = svcRemote("GameService", "RF", "ModeCondition")
+    if not rf then return false end
+    -- InvokeServer can yield for as long as the server likes (it never returns while the match is
+    -- being set up / restarted), so never wait on it: fire it in its own thread
+    task.spawn(function() pcall(function() return rf:InvokeServer("ConfirmedSelection", picks, lanes) end) end)
+    return true
+end
+
+local function evNames(t)
+    local out = {}
+    for k, v in pairs(t) do table.insert(out, type(k) == "string" and k or tostring(v)) end
+    table.sort(out)
+    return #out > 0 and table.concat(out, ", ") or "none"
+end
+
+local function evHandle(prompt)
+    EV.busy = true
+    local ok, err = pcall(function()
+        task.wait(0.6)    -- let the game finish building the cards
+        if not prompt.Parent then return end
+        local offered = evOffered(prompt)
+        if #offered == 0 then EV.seen = nil return end   -- not populated yet, look again
+        local accept, picks = evDecide(offered)
+        local offeredText = table.concat(offered, ", ")
+
+        if accept then
+            local lanes = evLanes()
+            if evConfirm(picks, lanes) then
+                evSay(("Confirmed: %s | %d lanes (offered: %s) after %d restart(s)"):format(evNames(picks), lanes, offeredText, EV.restarts))
+                addLog(("Event: picked %s, %d lanes"):format(evNames(picks), lanes))
+            else
+                evSay("Could not confirm (GameService.ModeCondition not found).")
+            end
+            EV.restarts = 0
+            EV.holding = false     -- accepted: the macro may start once the selection screen closes
+            return
+        end
+
+        -- wanted modifier not offered: confirm, then restart from the settings and wait for the next offer
+        EV.restarts += 1
+        evSay(("Restart #%d - not offered: wanted modifier (offered: %s)"):format(EV.restarts, offeredText))
+        -- keep the macro out of this match: stop a run in progress and hold the next start until
+        -- the modifiers are accepted (the watcher then starts it fresh on the accepted match)
+        EV.holding = true
+        if M.playing then stopPlayback() end
+        M.rearm = true
+        evConfirm({}, 1)
+        local t = os.clock()
+        while prompt.Parent and os.clock() - t < 4 do task.wait(0.2) end
+        local restart = svcRemote("GameService", "RF", "RestartMatch")
+        if not restart then evSay("RestartMatch remote not found.") EV.auto = false EV.holding = false return end
+        for attempt = 1, 4 do
+            if not (EV.auto and M.alive) then return end
+            task.spawn(function() pcall(function() return restart:InvokeServer() end) end)   -- may never return; don't wait
+            local t2 = os.clock()
+            while os.clock() - t2 < 12 do
+                task.wait(0.4)
+                local main = LocalPlayer.PlayerGui:FindFirstChild("Main")
+                local p2 = main and main:FindFirstChild("SelectionPrompt")
+                if p2 and p2 ~= prompt then return end    -- new offer is up; the loop handles it
+            end
+        end
+        evSay("Restart did not bring up a new offer. Restart the match yourself, then turn this back on.")
+        EV.auto = false
+        EV.holding = false
+    end)
+    if not ok then evSay("Event picker error: " .. tostring(err)) EV.holding = false end
+    EV.busy = false
+end
+
+-- The macro must not run while the event is still choosing modifiers. True while the selection
+-- screen is open, and (with the picker on) from the moment it decides to restart until it accepts.
+function M.holdMacro()
+    local main = LocalPlayer.PlayerGui:FindFirstChild("Main")
+    if main and main:FindFirstChild("SelectionPrompt") then return true end
+    return (EV.auto and (EV.holding or EV.busy)) and true or false
+end
+
+task.spawn(function()
+    while genv.__ATDMacro == M and M.alive do
+        task.wait(0.4)
+        if EV.auto and not EV.busy and not (M.recording or M.finalizing) then
+            local main   = LocalPlayer.PlayerGui:FindFirstChild("Main")
+            local prompt = main and main:FindFirstChild("SelectionPrompt")
+            if prompt and prompt ~= EV.seen then
+                EV.seen = prompt
+                evHandle(prompt)
+            end
+        end
+    end
+end)
+
+local secEvPick = tabEvent:Section({ Side = "Left" })
+local secEvInfo = tabEvent:Section({ Side = "Right" })
+
+secEvPick:Header({ Text = "Garden event picker" })
+secEvPick:Toggle({
+    Name = "Auto pick modifiers & lanes", Default = false,
+    Callback = function(v)
+        EV.auto = v
+        if v then EV.restarts = 0 EV.seen = nil else EV.holding = false end
+    end,
+}, "EventAuto")
+secEvPick:Dropdown({
+    Name = "Modifier mode", Search = false, Multi = false, Required = true,
+    Options = EV_MODES, Default = 1,
+    Callback = function(v) if v then EV.mode = v end end,
+}, "EventMode")
+evLaneSlider = secEvPick:Slider({
+    Name = "Lanes to select", Default = 12, Minimum = 1, Maximum = 12, Precision = 0, DisplayMethod = "Value",
+}, "EventLanes")
+evLevelSlider = secEvPick:Slider({
+    Name = "Restarts before settling for next priority", Default = 10, Minimum = 1, Maximum = 100, Precision = 0,
+    DisplayMethod = "Value",
+}, "EventRestartsPerLevel")
+secEvPick:Divider()
+secEvPick:Header({ Text = "Modifier priority (0 = skip, higher = wanted more)" })
+for _, name in ipairs(evCardNames) do
+    local c = gardenCards[name]
+    EV.sliders[name] = secEvPick:Slider({
+        Name = ("%s (%s)"):format(name, tostring(c.rarity or "?")), Default = 0, Minimum = 0, Maximum = 10, Precision = 0,
+        DisplayMethod = "Value",
+    }, "EventPri_" .. name)
+end
+
+evStatus = secEvInfo:Paragraph({ Header = "Status", Body = "Idle. Turn on 'Auto pick' before the event's selection screen." })
+do
+    local lines = {}
+    for _, name in ipairs(evCardNames) do
+        local c = gardenCards[name]
+        table.insert(lines, ("%s [%s, %s%% offer weight]\n   %s"):format(
+            name, tostring(c.rarity or "?"), tostring(math.floor((tonumber(c.weight) or 0) * 100 + 0.5)), tostring(c.description or "")))
+    end
+    secEvInfo:Paragraph({
+        Header = ("All modifiers (%d)"):format(#evCardNames),
+        Body = #lines > 0 and table.concat(lines, "\n") or "Card list not available here (open the event place).",
+    })
+end
+secEvInfo:Paragraph({
+    Header = "How it works",
+    Body = "The server offers only some modifiers each time, so the one you want can be missing. Priority + restart: modifiers sharing a priority number form one level, and a level counts only when ALL of them are offered together. If your current level isn't complete, it confirms, restarts the match from the settings and checks the next offer. After the chosen number of restarts it also accepts the next level down, and so on; once every priority level has been tried it accepts the offer. When it accepts, it selects the wanted modifier plus every other modifier offered. 'Pick every offered modifier' ignores priorities.",
+})
 
 -- Reward pop-up clicker. While a pop-up is open the game keeps a UserInputService.InputBegan
 -- handler that moves to the next reward on a left click. We find that handler in memory and
