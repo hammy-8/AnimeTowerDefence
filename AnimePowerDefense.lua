@@ -851,12 +851,15 @@ function saveMacro()
     if ok then
         notify(("Saved '%s' (%d steps)."):format(name, #M.steps))
         refreshDropdown()
+        -- select what we just saved, so a config saved now remembers (and autoloads) this macro
+        M.selected = name
+        if macroDropdown then pcall(function() macroDropdown:UpdateSelection(name) end) end
     else
         notify("Save failed: " .. tostring(err))
     end
 end
 
-local function loadMacro(name)
+local function loadMacro(name, quiet)
     name = name or M.selected
     if not name then return notify("Select a macro first.") end
     local ok, data = pcall(function()
@@ -872,7 +875,8 @@ local function loadMacro(name)
     refreshSteps()
     status()
     addLog(("Loaded '%s' (%d steps)"):format(name, #M.steps))
-    notify(("Loaded '%s' (%d steps)."):format(name, #M.steps))
+    if not quiet then notify(("Loaded '%s' (%d steps)."):format(name, #M.steps)) end
+    return true
 end
 
 local function deleteMacro()
@@ -908,6 +912,11 @@ local setArmed
 local function setRecording(v)
     if v then
         if M.recording then return end
+        if M.configLoading then
+            -- a config must never start a recording on rejoin
+            syncToggle(recToggle, false)
+            return
+        end
         if M.finalizing then
             notify("Still finishing the last recording.")
             syncToggle(recToggle, false)
@@ -928,6 +937,12 @@ end
 function setArmed(v)
     if v then
         if M.armed then return end
+        if M.configLoading then
+            -- a config is being applied: its saved macro isn't loaded yet. Remember the wish and
+            -- let finishConfig arm once the macro is in (the toggle stays ON meanwhile).
+            M.wantArm = true
+            return
+        end
         if M.recording or M.finalizing then
             notify("Stop recording first.")
             syncToggle(playToggle, false)
@@ -953,6 +968,7 @@ end
 recToggle = secControl:Toggle({
     Name = "Record macro (turn off to save)", Default = false, Callback = setRecording,
 }, "RecordMacro")
+recToggle.IgnoreConfig = true   -- never saved in configs: loading one must not start a recording
 secControl:Keybind({
     Name = "Record hotkey", Default = Enum.KeyCode.F6,
     Callback = function()
@@ -1071,7 +1087,7 @@ end
 
 local J = {
     mode = "Story", map = nil, stage = nil, diff = nil,
-    autoStart = true, auto = false, busy = false, nextTry = 0,
+    autoStart = false, auto = false, busy = false, nextTry = 0,
 }
 M.join = J
 
@@ -1333,7 +1349,7 @@ ddDiff = secJoinPick:Dropdown({
 secJoinRun:Header({ Text = "Join" })
 joinStatus = secJoinRun:Paragraph({ Header = "Status", Body = "Idle. Pick a gamemode, map, stage and difficulty." })
 secJoinRun:Toggle({
-    Name = "Start the match after joining", Default = true,
+    Name = "Start the match after joining", Default = false,
     Callback = function(v) J.autoStart = v end,
 }, "JoinAutoStart")
 secJoinRun:Button({
@@ -1410,8 +1426,12 @@ end
 -- Every portal the game defines (not just the ones you hold), so the picks never depend on
 -- how many you own: playing a portal uses it up, and a win hands one back at the same tier or
 -- higher, so we resolve the actual item at replay time.
-local PORTAL_TIER_MIN, PORTAL_TIER_MAX = 0, 15
+-- The true top tier comes from the game's own portal definition: `tierCap` (a win only
+-- upgrades a portal while its tier is below the cap). Portals with no tierCap have no cap in
+-- the game's code, so for those the highest tier you actually hold is the real ceiling.
+local PORTAL_TIER_MIN = 0
 local allPortalNamesCache
+local portalCapByName = {}    -- name -> tierCap (only for capped portals)
 local function allPortalNames()
     if allPortalNamesCache then return allPortalNamesCache end
     local names, seen = {}, {}
@@ -1421,11 +1441,24 @@ local function allPortalNames()
             if ok and type(def) == "table" and def.category == "Portal" and not seen[name] then
                 seen[name] = true
                 table.insert(names, tostring(name))
+                if tonumber(def.tierCap) then portalCapByName[tostring(name)] = tonumber(def.tierCap) end
             end
         end
     end
     allPortalNamesCache = names
     return names
+end
+
+-- highest tier you can pick for this portal: its tierCap, else the best tier you hold
+local function maxTierFor(name, list)
+    allPortalNames()
+    local cap = portalCapByName[name]
+    if cap then return cap, true end
+    local best = PORTAL_TIER_MIN
+    for _, p in ipairs(list or {}) do
+        if p.name == name and p.tier > best then best = p.tier end
+    end
+    return best, false
 end
 
 local function portalNames(list)
@@ -1442,9 +1475,10 @@ end
 
 local function tierLabelFor(t) return "Tier " .. t end
 
-local function tierOptions()
+local function tierOptions(name, list)
     local out = {}
-    for t = PORTAL_TIER_MIN, PORTAL_TIER_MAX do table.insert(out, tierLabelFor(t)) end
+    local maxT = maxTierFor(name, list)
+    for t = PORTAL_TIER_MIN, maxT do table.insert(out, tierLabelFor(t)) end
     return out
 end
 
@@ -1454,31 +1488,61 @@ local function pStatus(text)
     if portalStatus then pcall(function() portalStatus:UpdateBody(text) end) end
 end
 
+-- rebuild the Tier dropdown for the current portal, keeping the pick when it is still valid
+local function refreshTierOptions(list)
+    list = list or ownedPortals()
+    local maxT = maxTierFor(P.name, list)
+    if P.tier == nil then
+        local best
+        for _, p in ipairs(list) do
+            if p.name == P.name and (not best or p.tier > best) then best = p.tier end
+        end
+        P.tier = best or 0
+    end
+    P.tier = math.clamp(P.tier, PORTAL_TIER_MIN, maxT)
+    setOptions(ddTier, tierOptions(P.name, list), tierLabelFor(P.tier))
+end
+
+-- one line per portal, tiers collapsed: "Heaven Portal (best Tier 2): T0 x1, T1 x19, T2 x1"
+local function ownedSummary(list)
+    local order, byName = {}, {}
+    for _, p in ipairs(list) do
+        local g = byName[p.name]
+        if not g then g = { name = p.name, tiers = {} } byName[p.name] = g table.insert(order, g) end
+        g.tiers[p.tier] = (g.tiers[p.tier] or 0) + p.amount
+    end
+    local lines = {}
+    for _, g in ipairs(order) do
+        local ts = {}
+        for t in pairs(g.tiers) do table.insert(ts, t) end
+        table.sort(ts)
+        local parts = {}
+        for _, t in ipairs(ts) do table.insert(parts, ("T%d x%d"):format(t, g.tiers[t])) end
+        local maxT, capped = maxTierFor(g.name, list)
+        table.insert(lines, ("%s (%s Tier %d): %s"):format(g.name, capped and "max" or "best", maxT, table.concat(parts, ", ")))
+    end
+    return lines
+end
+
+local lastOwnedSig
 local function refreshPortals()
     local list  = ownedPortals()
     local names = portalNames(list)
     if not (P.name and table.find(names, P.name)) then
         P.name = (list[1] and list[1].name) or names[1]
     end
-    if P.tier == nil then
-        local best
-        for _, p in ipairs(list) do
-            if p.name == P.name and (not best or p.tier > best) then best = p.tier end
-        end
-        P.tier = math.clamp(best or 0, PORTAL_TIER_MIN, PORTAL_TIER_MAX)
-    end
     setOptions(ddPortal, names, P.name)
-    setOptions(ddTier, tierOptions(), tierLabelFor(P.tier))
+    refreshTierOptions(list)
 
-    local lines = {}
-    for _, p in ipairs(list) do
-        table.insert(lines, ("%s - Tier %d  x%d"):format(p.name, p.tier, p.amount))
-    end
+    local lines = ownedSummary(list)
     if portalOwnedPara then
         pcall(function()
             portalOwnedPara:UpdateBody(#lines > 0 and table.concat(lines, "\n") or "No portals in your inventory.")
         end)
     end
+    local sig = {}
+    for _, p in ipairs(list) do table.insert(sig, p.name .. ":" .. p.tier .. ":" .. p.amount) end
+    lastOwnedSig = table.concat(sig, "|")
 end
 
 -- the key of a portal we own right now matching the picked name + tier
@@ -1528,6 +1592,87 @@ local function replayPickedPortal(fromAuto)
     return true
 end
 
+---------------------------------------------------------------------------
+-- Portal joiner (lobby): open the picked portal from your inventory, wait X seconds (so
+-- friends can hop in), then start it.
+--   ItemService.RF.UsePortal(<inventory key>)   what the inventory "Use" button calls
+--   PodService.RF.StartPortal()                 what the portal's Start button calls
+---------------------------------------------------------------------------
+local PJ = { auto = false, busy = false, nextTry = 0, cancel = false, delay = 10 }
+M.portalJoin = PJ
+
+local function svcRemote(service, kind, name)
+    local s = Knit:FindFirstChild(service)
+    local k = s and s:FindFirstChild(kind)
+    return k and k:FindFirstChild(name) or nil
+end
+
+local joinStatus2, delaySlider
+local function jStat(text)
+    PJ.lastStatus = text
+    if joinStatus2 then pcall(function() joinStatus2:UpdateBody(text) end) end
+end
+
+local function joinDelay()
+    local v = delaySlider and tonumber(delaySlider.Value)   -- .Value is always current, even after a config load
+    return math.floor((v or PJ.delay) + 0.5)
+end
+
+local function runPortalJoiner(fromAuto)
+    if PJ.busy then return end
+    if M.recording or M.finalizing then return end
+    if not inLobby() then
+        if not fromAuto then notify("The portal joiner only works in the lobby.") end
+        return
+    end
+    local key, p = pickedPortalKey()
+    if not key then
+        jStat(("Waiting: you do not hold %s Tier %d right now."):format(tostring(P.name), P.tier or 0))
+        if not fromAuto then notify(("You don't hold %s Tier %d right now."):format(tostring(P.name), P.tier or 0)) end
+        PJ.nextTry = os.clock() + 10
+        return
+    end
+    local use   = svcRemote("ItemService", "RF", "UsePortal")
+    local start = svcRemote("PodService", "RF", "StartPortal")
+    if not (use and start) then
+        jStat("Portal remotes not found (ItemService.UsePortal / PodService.StartPortal).")
+        PJ.nextTry = os.clock() + 30
+        return
+    end
+
+    PJ.busy, PJ.cancel = true, false
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local desc = ("%s - Tier %d"):format(p.name, p.tier)
+            local okUse, res = pcall(function() return use:InvokeServer(key) end)
+            if not okUse then error("UsePortal failed: " .. tostring(res)) end
+            addLog("Opened portal: " .. desc)
+
+            local waitFor = joinDelay()
+            for left = waitFor, 1, -1 do
+                if PJ.cancel or not M.alive then jStat("Cancelled.") return end
+                jStat(("Opened %s. Starting in %ds..."):format(desc, left))
+                task.wait(1)
+            end
+            if PJ.cancel or not M.alive then jStat("Cancelled.") return end
+
+            local okStart, res2 = pcall(function() return start:InvokeServer() end)
+            if not okStart then error("StartPortal failed: " .. tostring(res2)) end
+            jStat("Started " .. desc)
+            addLog("Started portal: " .. desc)
+            notify("Started " .. desc)
+        end)
+        if not ok then
+            jStat("Portal joiner error: " .. tostring(err))
+            PJ.nextTry = os.clock() + 20
+        else
+            PJ.nextTry = os.clock() + 25   -- the match is loading; don't re-open while teleporting
+        end
+        PJ.busy = false
+    end)
+end
+M.runPortalJoiner = runPortalJoiner
+
 local secPortalPick = tabPortal:Section({ Side = "Left" })
 local secPortalRun  = tabPortal:Section({ Side = "Right" })
 
@@ -1536,7 +1681,10 @@ ddPortal = secPortalPick:Dropdown({
     Name = "Portal", Search = true, Multi = false, Required = false,
     Options = {},
     Callback = function(v)
-        if v then P.name = v end
+        if v and v ~= P.name then
+            P.name = v
+            refreshTierOptions()      -- each portal has its own top tier
+        end
     end,
 }, "PortalName")
 ddTier = secPortalPick:Dropdown({
@@ -1559,6 +1707,27 @@ local portalAutoToggle = secPortalRun:Toggle({
     Name = "Auto replay selected portal (end screen)", Default = false,
     Callback = function(v) P.auto = v end,
 }, "PortalAutoReplay")
+
+secPortalRun:Divider()
+secPortalRun:Header({ Text = "Portal joiner (lobby)" })
+joinStatus2 = secPortalRun:Paragraph({ Header = "Joiner status", Body = "Idle." })
+delaySlider = secPortalRun:Slider({
+    Name = "Wait before joining (seconds)", Default = 10, Minimum = 0, Maximum = 120, Precision = 0,
+    DisplayMethod = "Value",
+    Callback = function(v) PJ.delay = v end,
+}, "PortalJoinDelay")
+secPortalRun:Button({
+    Name = "Open & join selected portal now",
+    Callback = function() runPortalJoiner(false) end,
+})
+secPortalRun:Button({
+    Name = "Cancel joiner",
+    Callback = function() PJ.cancel = true end,
+})
+secPortalRun:Toggle({
+    Name = "Auto portal joiner (while in the lobby)", Default = false,
+    Callback = function(v) PJ.auto = v if not v then PJ.cancel = true end end,
+}, "PortalJoinAuto")
 secPortalRun:Divider()
 secPortalRun:Paragraph({
     Header = "Notes",
@@ -1590,6 +1759,21 @@ end)
 
 M.replayPortal = replayPickedPortal
 pcall(refreshPortals)
+
+-- keep the owned list / max tiers current (a win hands out a higher tier) and drive the joiner
+task.spawn(function()
+    while genv.__ATDMacro == M and M.alive do
+        task.wait(3)
+        local list = ownedPortals()
+        local sig = {}
+        for _, p in ipairs(list) do table.insert(sig, p.name .. ":" .. p.tier .. ":" .. p.amount) end
+        if table.concat(sig, "|") ~= lastOwnedSig and not M.configLoading then pcall(refreshPortals) end
+        if PJ.auto and not PJ.busy and os.clock() >= PJ.nextTry and not M.configLoading
+            and not (M.recording or M.finalizing) and inLobby() and not podUiOpen() then
+            runPortalJoiner(true)
+        end
+    end
+end)
 
 -- Reward pop-up clicker. While a pop-up is open the game keeps a UserInputService.InputBegan
 -- handler that moves to the next reward on a left click. We find that handler in memory and
@@ -1671,8 +1855,90 @@ task.spawn(function()
     end
 end)
 
+---------------------------------------------------------------------------
+-- Configs
+-- MacLib applies a config by firing every saved element at once, in no particular order, and it
+-- skips toggles that were saved OFF. That broke three things, so we finish the job ourselves
+-- after it has run (for the autoload on rejoin AND for the manual "Load Config" button):
+--   * dependent dropdowns (gamemode -> map -> stage -> difficulty, portal -> tier) are re-applied in order
+--   * toggles saved OFF are really switched off (otherwise a default-ON toggle could never stay off)
+--   * the saved macro is loaded, and only THEN is "Play macro" armed
+---------------------------------------------------------------------------
+local CFG_ORDER = { "JoinMode", "JoinMap", "JoinStage", "JoinDifficulty", "PortalName", "PortalTier" }
+local CFG_SKIP  = { RecordMacro = true }
+
 MacLib:SetFolder("ATD_Macro_Config")
 tabSettings:InsertConfigSection("Left")
+
+local function readConfig(name)
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(MacLib.Folder .. "/settings/" .. name .. ".json"))
+    end)
+    local saved = {}
+    if ok and type(data) == "table" and type(data.objects) == "table" then
+        for _, o in ipairs(data.objects) do
+            if type(o) == "table" and o.flag then saved[o.flag] = o end
+        end
+    end
+    return saved
+end
+
+local function finishConfig(name)
+    local saved = readConfig(name)
+
+    for _, flag in ipairs(CFG_ORDER) do
+        local o, opt = saved[flag], MacLib.Options[flag]
+        if o and opt and o.value then
+            pcall(function() opt:UpdateSelection(o.value) end)
+            task.wait(0.2)
+        end
+    end
+
+    for flag, o in pairs(saved) do
+        if o.type == "Toggle" and o.state == false and not CFG_SKIP[flag] then
+            local opt = MacLib.Options[flag]
+            if opt and opt.GetState and opt:GetState() then
+                pcall(function() opt:UpdateState(false) end)
+            end
+        end
+    end
+
+    -- the macro stored in this config
+    local macroName = saved.SavedMacros and saved.SavedMacros.value
+    if type(macroName) ~= "string" or macroName == "" then macroName = M.selected end
+    if macroName and not (M.recording or M.finalizing or M.playing) then
+        M.selected = macroName
+        loadMacro(macroName, true)
+    end
+
+    M.configLoading = false
+    if M.wantArm then
+        M.wantArm = false
+        if not M.armed then
+            setArmed(true)     -- macro is loaded now; this keeps the toggle on instead of bouncing it off
+        end
+    end
+    status()
+end
+
+do
+    local origLoadConfig = MacLib.LoadConfig
+    function MacLib:LoadConfig(path)
+        M.configLoading = true
+        local ok, err = origLoadConfig(self, path)
+        if ok == true and path then
+            task.spawn(function()
+                task.wait(0.8)       -- MacLib applies each saved element in its own thread
+                local okF, errF = pcall(finishConfig, path)
+                M.configLoading = false
+                if not okF then notify("Config finish error: " .. tostring(errF), 6) end
+            end)
+        else
+            M.configLoading = false
+        end
+        return ok, err
+    end
+end
 
 ---------------------------------------------------------------------------
 -- Cleanup
@@ -1700,4 +1966,13 @@ end)
 
 tabMacro:Select()
 status()
-notify("Loaded v5. F6 = record on/off, F7 = play on/off.")
+notify("Loaded v6. F6 = record on/off, F7 = play on/off.")
+
+-- apply the autoload config now that every element exists (this is what makes the selected
+-- config actually load on rejoin; finishConfig then runs through the LoadConfig wrapper)
+task.spawn(function()
+    task.wait(0.5)
+    if genv.__ATDMacro ~= M or not M.alive then return end
+    local ok, err = pcall(function() MacLib:LoadAutoLoadConfig() end)
+    if not ok then notify("Autoload failed: " .. tostring(err), 6) end
+end)
