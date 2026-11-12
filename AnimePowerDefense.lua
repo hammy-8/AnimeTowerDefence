@@ -75,6 +75,7 @@ local M = {
     replayMap  = {},
 }
 genv.__ATDMacro = M
+M.autoDismiss = true     -- click through the end-of-match reward pop-ups (Main.View)
 
 ---------------------------------------------------------------------------
 -- Remotes
@@ -249,6 +250,8 @@ end
 
 local group = Window:TabGroup()
 local tabMacro    = group:Tab({ Name = "Macro",        Image = "rbxassetid://18821914323" })
+local tabJoiners  = group:Tab({ Name = "Joiners",      Image = "rbxassetid://18821914323" })
+local tabPortal   = group:Tab({ Name = "Portal",       Image = "rbxassetid://18821914323" })
 local tabLog      = group:Tab({ Name = "Steps & Log",  Image = "rbxassetid://18821914323" })
 local tabSettings = group:Tab({ Name = "Settings",     Image = "rbxassetid://10734950309" })
 
@@ -757,6 +760,13 @@ local function fireGame(...)
     pcall(function() Events.Game:FireServer(unpack(args, 1, args.n)) end)
 end
 
+-- The end-of-match reward pop-ups (gems, items, units) are the game's Main.View frame. It
+-- shows one reward at a time and every mouse click moves to the next; Replay does nothing
+-- useful until they are all gone.
+local function rewardPopupOpen()
+    return guiVisible("View")
+end
+
 task.spawn(function()
     local function phaseNow()
         if guiVisible("Ending") then return "ending" end
@@ -776,7 +786,7 @@ task.spawn(function()
             if phase ~= "ending" then endSeen = os.clock() end
             if M.playing then stopPlayback() end
             startable = true
-            if M.autoReplay and not (M.recording or M.finalizing)
+            if M.autoReplay and not (M.recording or M.finalizing) and not rewardPopupOpen()
                 and os.clock() - endSeen >= 1.5 and os.clock() - lastRetry >= 6 then
                 lastRetry = os.clock()
                 addLog("Auto replay")
@@ -968,6 +978,10 @@ secControl:Toggle({
     Name = "Auto replay game (win screen)", Default = false,
     Callback = function(v) M.autoReplay = v end,
 }, "AutoReplay")
+secControl:Toggle({
+    Name = "Auto click reward pop-ups (end of match)", Default = true,
+    Callback = function(v) M.autoDismiss = v end,
+}, "AutoDismissRewards")
 secControl:Button({
     Name = "Run macro now (testing)",
     Callback = function()
@@ -1025,6 +1039,576 @@ secLog:Header({ Text = "Live log" })
 logPara = secLog:Paragraph({ Header = "Events", Body = "Nothing yet." })
 secSteps:Header({ Text = "Macro steps (exact order)" })
 stepsPara = secSteps:Paragraph({ Header = "Steps", Body = "No steps yet." })
+
+---------------------------------------------------------------------------
+-- Joiners: pick gamemode / map / stage / difficulty, walk into a pod, configure it, start it.
+-- Flow (verified in the lobby): touching a pod's Entrance makes the server fire
+--   Events.Pod "Open", true, <pod folder>
+-- then we send SetMap / SetStage / SetDifficulty and finally "Start". The server decides what
+-- you may pick (locked stages are silently ignored), so we read the pod's label back to check.
+---------------------------------------------------------------------------
+local LocalPlayer = Players.LocalPlayer
+local PodRemote   = Events:FindFirstChild("Pod")
+local ResourcesMod
+pcall(function() ResourcesMod = require(RS.Modules.Resources) end)
+
+local JOIN_MODES = {
+    { name = "Story",       pod = "Play",        filter = function(d) return d.MapType == "Story" and d.Section == "Play" end },
+    { name = "Raid",        pod = "Raid",        filter = function(d) return d.MapType == "Raid" end },
+    { name = "Cavern",      pod = "Cavern",      filter = function(d) return d.MapType == "Cavern" end },
+    { name = "Garden Maze", pod = "Garden Maze", filter = function(d) return d.MapType == "Garden Maze" end },
+}
+local JOIN_BY_NAME, JOIN_NAMES = {}, {}
+for _, m in ipairs(JOIN_MODES) do
+    JOIN_BY_NAME[m.name] = m
+    table.insert(JOIN_NAMES, m.name)
+end
+
+local J = {
+    mode = "Story", map = nil, stage = nil, diff = nil,
+    autoStart = true, auto = false, busy = false, nextTry = 0,
+}
+M.join = J
+
+local function mapDataOf(id)
+    if not (ResourcesMod and id) then return nil end
+    local ok, d = pcall(function() return ResourcesMod.Maps:GetMapData(id) end)
+    return ok and d or nil
+end
+
+local function mapsForMode(mode)
+    local rows = {}
+    if not ResourcesMod then return rows end
+    local ok, all = pcall(function() return ResourcesMod.Maps:GetMaps() end)
+    if not ok or type(all) ~= "table" then return rows end
+    for id, d in pairs(all) do
+        if mode.filter(d) then table.insert(rows, { id = id, order = d.Order or 99 }) end
+    end
+    table.sort(rows, function(a, b)
+        if a.order ~= b.order then return a.order < b.order end
+        return a.id < b.id
+    end)
+    local names = {}
+    for _, r in ipairs(rows) do table.insert(names, r.id) end
+    return names
+end
+
+local function countOf(t)
+    if type(t) ~= "table" then return 0 end
+    local n = #t
+    if n > 0 then return n end
+    for _ in pairs(t) do n += 1 end
+    return n
+end
+
+local function stageLabels(mapId)
+    local d = mapDataOf(mapId)
+    local out = {}
+    if not d then return out end
+    local n = d.CustomStages and countOf(d.CustomStages) or countOf(d.Stages)
+    for i = 1, n do
+        local custom = d.CustomStages and d.CustomStages[i]
+        table.insert(out, custom and ("Stage %d (%s)"):format(i, tostring(custom)) or ("Stage %d"):format(i))
+    end
+    if d.HasInfiniteMode then table.insert(out, "Infinite") end
+    return out
+end
+
+local function stageValue(label)
+    if not label then return nil end
+    if label == "Infinite" then return "Infinite" end
+    return tonumber(label:match("^Stage (%d+)"))
+end
+
+local function difficultiesFor(mapId)
+    local d = mapDataOf(mapId)
+    local out = {}
+    if d and type(d.Difficulties) == "table" then
+        for _, v in ipairs(d.Difficulties) do table.insert(out, v) end
+    end
+    return out
+end
+
+local joinStatus, ddMode, ddMap, ddStage, ddDiff
+
+local function jStatus(text)
+    J.lastStatus = text
+    if joinStatus then pcall(function() joinStatus:UpdateBody(text) end) end
+end
+
+local function setOptions(dd, list, pick)
+    if not dd then return end
+    pcall(function() dd:ClearOptions() end)
+    if #list > 0 then pcall(function() dd:InsertOptions(list) end) end
+    if pick then pcall(function() dd:UpdateSelection(pick) end) end
+end
+
+local refreshStagesAndDiffs
+local function refreshMaps()
+    local list = mapsForMode(JOIN_BY_NAME[J.mode])
+    J.map = list[1]
+    setOptions(ddMap, list, J.map)
+    refreshStagesAndDiffs()
+end
+
+function refreshStagesAndDiffs()
+    local stages = stageLabels(J.map)
+    J.stage = stages[1]
+    setOptions(ddStage, stages, J.stage)
+    local diffs = difficultiesFor(J.map)
+    J.diff = diffs[1]
+    setOptions(ddDiff, diffs, J.diff)
+end
+
+local function inLobby()
+    if not ResourcesMod then return false end
+    local ok, place = pcall(function() return ResourcesMod.IsCurrentPlace() end)
+    return ok and place == "Lobby"
+end
+
+local function podUiOpen()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("Main")
+    local ui = main and main:FindFirstChild("Pod")
+    return (ui and ui:IsA("GuiObject") and ui.Visible) or false
+end
+
+local function podRemote(...)
+    local args = table.pack(...)
+    pcall(function() PodRemote:FireServer(unpack(args, 1, args.n)) end)
+end
+
+-- touch a pod's Entrance and wait for the server to open it for us
+local function tryEnter(pod)
+    local opened = false
+    local conn = PodRemote.OnClientEvent:Connect(function(act, _, inst)
+        if act == "Open" and inst == pod then opened = true end
+    end)
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    local ent  = pod:FindFirstChild("Entrance")
+    if hrp and ent then
+        pcall(firetouchinterest, hrp, ent, 1)
+        task.wait(0.15)
+        pcall(firetouchinterest, hrp, ent, 0)
+        local t = os.clock()
+        while not opened and os.clock() - t < 2 do task.wait(0.1) end
+    end
+    conn:Disconnect()
+    return opened
+end
+
+-- pod label looks like "Desert Town - 1 (1/4)"
+local function readPodLabel(pod)
+    local label = pod:GetAttribute("TextLabel")
+    if type(label) ~= "string" then return nil end
+    local map, stage = label:match("^(.-) %- (.-) %(%d+/%d+%)$")
+    return map, stage
+end
+
+local function joinSelected(startNow)
+    if J.busy then return notify("Already joining...") end
+    if M.recording or M.finalizing then return notify("Stop recording first.") end
+    if not PodRemote then return notify("Pod remote not found.") end
+    if not inLobby() then return notify("Joiners only work in the lobby.") end
+    local mode = JOIN_BY_NAME[J.mode]
+    if not mode then return notify("Pick a gamemode.") end
+    local stage = stageValue(J.stage)
+    if not J.map or stage == nil then return notify("Pick a map and a stage.") end
+    local diffs = difficultiesFor(J.map)
+    local diff = (#diffs > 0) and (J.diff or diffs[1]) or nil
+
+    J.busy = true
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if podUiOpen() then
+                podRemote("Leave")
+                task.wait(0.7)
+            end
+
+            local pods = {}
+            for _, p in ipairs(workspace:WaitForChild("Pods"):GetChildren()) do
+                if p.Name == mode.pod and p:FindFirstChild("Entrance") then table.insert(pods, p) end
+            end
+            if #pods == 0 then
+                jStatus("No '" .. mode.pod .. "' pods found.")
+                return
+            end
+
+            local pod
+            for i, p in ipairs(pods) do
+                jStatus(("Entering %s pod %d/%d..."):format(mode.name, i, #pods))
+                if tryEnter(p) then pod = p break end
+            end
+            if not pod then
+                jStatus("No pod would open (all full or locked?).")
+                notify("Could not enter any " .. mode.name .. " pod.")
+                return
+            end
+
+            podRemote("SetMap", J.map)
+            task.wait(0.35)
+            podRemote("SetStage", stage)
+            task.wait(0.35)
+            if diff then
+                podRemote("SetDifficulty", diff)
+                task.wait(0.35)
+                podRemote("SetStage", stage)   -- the game re-selects the stage after a difficulty change
+                task.wait(0.5)
+            end
+
+            -- the server ignores locked picks, so confirm what the pod really holds
+            local gotMap, gotStage = readPodLabel(pod)
+            if gotMap and (gotMap ~= (mapDataOf(J.map) and mapDataOf(J.map).DisplayName or J.map)
+                or tostring(gotStage) ~= tostring(stage)) then
+                podRemote("Leave")
+                local msg = ("Server kept %s - %s (you asked for %s - %s). Locked? Not started."):format(
+                    tostring(gotMap), tostring(gotStage), J.map, tostring(stage))
+                jStatus(msg)
+                notify(msg, 6)
+                J.nextTry = os.clock() + 15
+                return
+            end
+
+            local desc = ("%s: %s, %s%s"):format(mode.name, J.map, tostring(J.stage), diff and (", " .. diff) or "")
+            if startNow then
+                podRemote("Start")
+                jStatus("Started " .. desc)
+                notify("Started " .. desc)
+            else
+                jStatus("Ready in pod: " .. desc .. " (press Start in the pod UI)")
+                notify("Joined pod: " .. desc)
+            end
+        end)
+        if not ok then
+            jStatus("Join error: " .. tostring(err))
+            J.nextTry = os.clock() + 15
+        end
+        J.busy = false
+    end)
+end
+
+M.joinSelected = joinSelected
+
+local secJoinPick = tabJoiners:Section({ Side = "Left" })
+local secJoinRun  = tabJoiners:Section({ Side = "Right" })
+
+secJoinPick:Header({ Text = "Pick what to join" })
+ddMode = secJoinPick:Dropdown({
+    Name = "Gamemode", Search = false, Multi = false, Required = true,
+    Options = JOIN_NAMES, Default = 1,
+    Callback = function(v)
+        if v and v ~= J.mode and JOIN_BY_NAME[v] then
+            J.mode = v
+            refreshMaps()
+        end
+    end,
+}, "JoinMode")
+ddMap = secJoinPick:Dropdown({
+    Name = "Map", Search = true, Multi = false, Required = false,
+    Options = {},
+    Callback = function(v)
+        if v and v ~= J.map then
+            J.map = v
+            refreshStagesAndDiffs()
+        end
+    end,
+}, "JoinMap")
+ddStage = secJoinPick:Dropdown({
+    Name = "Stage", Search = false, Multi = false, Required = false,
+    Options = {},
+    Callback = function(v) if v then J.stage = v end end,
+}, "JoinStage")
+ddDiff = secJoinPick:Dropdown({
+    Name = "Difficulty", Search = false, Multi = false, Required = false,
+    Options = {},
+    Callback = function(v) if v then J.diff = v end end,
+}, "JoinDifficulty")
+
+secJoinRun:Header({ Text = "Join" })
+joinStatus = secJoinRun:Paragraph({ Header = "Status", Body = "Idle. Pick a gamemode, map, stage and difficulty." })
+secJoinRun:Toggle({
+    Name = "Start the match after joining", Default = true,
+    Callback = function(v) J.autoStart = v end,
+}, "JoinAutoStart")
+secJoinRun:Button({
+    Name = "Join selected",
+    Callback = function() joinSelected(J.autoStart) end,
+})
+secJoinRun:Toggle({
+    Name = "Auto join (while in the lobby)", Default = false,
+    Callback = function(v) J.auto = v end,
+}, "JoinAuto")
+secJoinRun:Button({
+    Name = "Leave current pod",
+    Callback = function() podRemote("Leave") end,
+})
+secJoinRun:Divider()
+secJoinRun:Paragraph({
+    Header = "Notes",
+    Body = "Works from the lobby only. It walks your character into a real pod, so the game's own unlock rules still apply: if you have not unlocked a stage or difficulty the server refuses it, and this tab leaves the pod and tells you instead of starting the wrong stage.",
+})
+
+task.spawn(function()
+    while genv.__ATDMacro == M and M.alive do
+        task.wait(3)
+        if J.auto and not J.busy and os.clock() >= J.nextTry
+            and not (M.recording or M.finalizing) and inLobby() and not podUiOpen() then
+            joinSelected(true)
+        end
+    end
+end)
+
+refreshMaps()
+
+---------------------------------------------------------------------------
+-- Portal: replay a chosen portal + tier from the end screen.
+-- Portals are inventory items (data.Inventory[key] = { id, tier, amount }, item category
+-- "Portal"). On a portal match's end screen the game's own list sends
+--   Events.Game:FireServer("Retry", <inventory key>)
+-- so that is exactly what we send. This is separate from the "Auto replay game" toggle.
+---------------------------------------------------------------------------
+local P = { name = nil, tier = nil, auto = false, lastFire = 0 }
+M.portal = P
+
+local function dataController()
+    local ok, dc = pcall(function()
+        return require(RS.Modules.Packages.Knit).GetController("DataController")
+    end)
+    return ok and dc or nil
+end
+
+-- every portal you own: { key, id, name, tier, amount }
+local function ownedPortals()
+    local out = {}
+    local dc  = dataController()
+    local inv = dc and dc.data and dc.data.Inventory
+    if type(inv) ~= "table" or not ResourcesMod then return out end
+    for key, entry in pairs(inv) do
+        if type(entry) == "table" and entry.id ~= nil then
+            local ok, name, def = pcall(ResourcesMod.GetItem, entry.id)
+            if ok and type(def) == "table" and def.category == "Portal" then
+                table.insert(out, {
+                    key = key, id = entry.id, name = tostring(name),
+                    tier = tonumber(entry.tier) or 0, amount = tonumber(entry.amount) or 1,
+                })
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        return a.tier < b.tier
+    end)
+    return out
+end
+
+-- Every portal the game defines (not just the ones you hold), so the picks never depend on
+-- how many you own: playing a portal uses it up, and a win hands one back at the same tier or
+-- higher, so we resolve the actual item at replay time.
+local PORTAL_TIER_MIN, PORTAL_TIER_MAX = 0, 15
+local allPortalNamesCache
+local function allPortalNames()
+    if allPortalNamesCache then return allPortalNamesCache end
+    local names, seen = {}, {}
+    if ResourcesMod then
+        for id = 5000, 5100 do
+            local ok, name, def = pcall(ResourcesMod.GetItem, id)
+            if ok and type(def) == "table" and def.category == "Portal" and not seen[name] then
+                seen[name] = true
+                table.insert(names, tostring(name))
+            end
+        end
+    end
+    allPortalNamesCache = names
+    return names
+end
+
+local function portalNames(list)
+    local names, seen = {}, {}
+    for _, n in ipairs(allPortalNames()) do
+        if not seen[n] then seen[n] = true table.insert(names, n) end
+    end
+    for _, p in ipairs(list) do
+        if not seen[p.name] then seen[p.name] = true table.insert(names, p.name) end
+    end
+    table.sort(names)
+    return names
+end
+
+local function tierLabelFor(t) return "Tier " .. t end
+
+local function tierOptions()
+    local out = {}
+    for t = PORTAL_TIER_MIN, PORTAL_TIER_MAX do table.insert(out, tierLabelFor(t)) end
+    return out
+end
+
+local portalStatus, ddPortal, ddTier, portalOwnedPara
+
+local function pStatus(text)
+    if portalStatus then pcall(function() portalStatus:UpdateBody(text) end) end
+end
+
+local function refreshPortals()
+    local list  = ownedPortals()
+    local names = portalNames(list)
+    if not (P.name and table.find(names, P.name)) then
+        P.name = (list[1] and list[1].name) or names[1]
+    end
+    if P.tier == nil then
+        local best
+        for _, p in ipairs(list) do
+            if p.name == P.name and (not best or p.tier > best) then best = p.tier end
+        end
+        P.tier = math.clamp(best or 0, PORTAL_TIER_MIN, PORTAL_TIER_MAX)
+    end
+    setOptions(ddPortal, names, P.name)
+    setOptions(ddTier, tierOptions(), tierLabelFor(P.tier))
+
+    local lines = {}
+    for _, p in ipairs(list) do
+        table.insert(lines, ("%s - Tier %d  x%d"):format(p.name, p.tier, p.amount))
+    end
+    if portalOwnedPara then
+        pcall(function()
+            portalOwnedPara:UpdateBody(#lines > 0 and table.concat(lines, "\n") or "No portals in your inventory.")
+        end)
+    end
+end
+
+-- the key of a portal we own right now matching the picked name + tier
+local function pickedPortalKey()
+    for _, p in ipairs(ownedPortals()) do
+        if p.name == P.name and p.tier == P.tier then return p.key, p end
+    end
+    return nil
+end
+
+local function endScreenHasPortal(key)
+    local pg   = LocalPlayer:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("Main")
+    local list = main and main:FindFirstChild("Ending") and main.Ending:FindFirstChild("Portals")
+    list = list and list:FindFirstChild("List")
+    return (list and list:FindFirstChild(tostring(key))) ~= nil
+end
+
+local function replayPickedPortal(fromAuto)
+    if not (P.name and P.tier ~= nil) then
+        if not fromAuto then notify("Pick a portal and tier first.") end
+        return false
+    end
+    local key, p = pickedPortalKey()
+    if not key then
+        pStatus(("Waiting: you do not hold %s Tier %d right now."):format(tostring(P.name), P.tier))
+        if not fromAuto then notify(("You don't hold %s Tier %d right now."):format(tostring(P.name), P.tier)) end
+        return false
+    end
+    if rewardPopupOpen() then
+        if not fromAuto then notify("Click through the reward pop-ups first.") end
+        return false
+    end
+    if not guiVisible("Ending") then
+        if not fromAuto then notify("Finish a portal match first - this replays from the end screen.") end
+        return false
+    end
+    if not endScreenHasPortal(key) then
+        if not fromAuto then notify("The end screen is not offering portals (not a portal match).") end
+        return false
+    end
+    fireGame("Retry", key)
+    P.lastFire = os.clock()
+    local msg = ("Replaying %s - Tier %d"):format(p.name, p.tier)
+    pStatus(msg)
+    addLog(msg)
+    return true
+end
+
+local secPortalPick = tabPortal:Section({ Side = "Left" })
+local secPortalRun  = tabPortal:Section({ Side = "Right" })
+
+secPortalPick:Header({ Text = "Portal" })
+ddPortal = secPortalPick:Dropdown({
+    Name = "Portal", Search = true, Multi = false, Required = false,
+    Options = {},
+    Callback = function(v)
+        if v then P.name = v end
+    end,
+}, "PortalName")
+ddTier = secPortalPick:Dropdown({
+    Name = "Tier", Search = false, Multi = false, Required = false,
+    Options = {},
+    Callback = function(v)
+        if v then P.tier = tonumber(v:match("^Tier (%d+)")) end
+    end,
+}, "PortalTier")
+secPortalPick:Button({ Name = "Refresh my portals", Callback = refreshPortals })
+portalOwnedPara = secPortalPick:Paragraph({ Header = "Your portals", Body = "..." })
+
+secPortalRun:Header({ Text = "Replay" })
+portalStatus = secPortalRun:Paragraph({ Header = "Status", Body = "Pick a portal and tier." })
+secPortalRun:Button({
+    Name = "Replay selected portal now",
+    Callback = function() replayPickedPortal(false) end,
+})
+local portalAutoToggle = secPortalRun:Toggle({
+    Name = "Auto replay selected portal (end screen)", Default = false,
+    Callback = function(v) P.auto = v end,
+}, "PortalAutoReplay")
+secPortalRun:Divider()
+secPortalRun:Paragraph({
+    Header = "Notes",
+    Body = "Replays from the end screen of a portal match, using the portal and tier you pick here. The pick does not depend on how many you hold: whichever portal of that tier you have at the end screen is the one replayed (a win gives you one back at the same tier or higher). If you hold none of that exact tier it just says so and waits. Independent of 'Auto replay game' on the Macro tab.",
+})
+
+task.spawn(function()
+    local endSince
+    while genv.__ATDMacro == M and M.alive do
+        task.wait(0.5)
+        if guiVisible("Ending") then
+            endSince = endSince or os.clock()
+            if P.auto and not (M.recording or M.finalizing) and not rewardPopupOpen()
+                and os.clock() - endSince >= 1.5 and os.clock() - P.lastFire >= 6 then
+                local key = pickedPortalKey()
+                if not key then
+                    -- nothing of that tier right now (e.g. the win gave a higher one): say so, keep waiting
+                    P.lastFire = os.clock() - 3
+                    pStatus(("Waiting: you do not hold %s Tier %d right now."):format(tostring(P.name), P.tier or 0))
+                elseif endScreenHasPortal(key) then
+                    replayPickedPortal(true)
+                end
+            end
+        else
+            endSince = nil
+        end
+    end
+end)
+
+M.replayPortal = replayPickedPortal
+pcall(refreshPortals)
+
+-- Reward pop-up clicker. A mouse click is what the game listens for (anywhere not on a GUI
+-- button, 0.3s apart), so we send a simulated click at the middle of the screen. Only in a
+-- match: in the lobby the same frame is used for viewing your own units, which we leave alone.
+local VIM = game:GetService("VirtualInputManager")
+local function clickScreen()
+    local cam = workspace.CurrentCamera
+    local vp  = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    pcall(function()
+        VIM:SendMouseButtonEvent(vp.X * 0.5, vp.Y * 0.5, 0, true, game, 1)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(vp.X * 0.5, vp.Y * 0.5, 0, false, game, 1)
+    end)
+end
+
+task.spawn(function()
+    while genv.__ATDMacro == M and M.alive do
+        task.wait(0.45)
+        if M.autoDismiss and rewardPopupOpen() and not inLobby()
+            and not (M.recording or M.finalizing) then
+            clickScreen()
+        end
+    end
+end)
 
 MacLib:SetFolder("ATD_Macro_Config")
 tabSettings:InsertConfigSection("Left")
